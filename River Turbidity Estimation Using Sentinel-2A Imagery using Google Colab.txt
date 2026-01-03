@@ -1,0 +1,184 @@
+#river-ndti-sentinel2
+
+# STEP 1:
+# Core imports and small install (run once in Colab)
+!pip install --quiet xee          # installs the xee package (an xarray - Earth Engine integration tool)
+
+
+# STEP 2:
+import ee            # imports the Google Earth Engine Python client library
+import geemap        # imports geemap, a wrapper to display interactive maps
+import xarray as xr  # imports xarray, a library for labeled multi-dimensional array (great for time/lat/lon data)
+import xee           # xarray + xee to convert a server-side ImageCollection into a local xarray. Dataset for plotting/analysis.
+
+
+# STEP 3:
+# Authenticate and initialize Google Earth Engine
+ee.Authenticate()   # Authenticates your session so code can call the EE servers.
+ee.Initialize(
+    project='ee-terraspatial82u',
+    opt_url='https://earthengine-highvolume.googleapis.com'
+    # used when you expect larger data transfers from EE
+)
+# Without authentication and initialization you cannot access Earth Engine data or run server-side operations
+
+
+# STEP 4:
+# Create an interactive geemap and display it
+
+# Creates a geemap.Map object and chooses the 'SATELLITE' basemap (just a visual background).
+# ee_initialize=False tells geemap not to auto-initialize EE for the map widget
+gmap = geemap.Map(basemap='SATELLITE', ee_initialize=False)
+gmap
+
+
+# STEP 5:
+# Capture the last drawn feature on the map as the region of interest (ROI)
+study_area = gmap.draw_last_feature.geometry()
+# geemap keeps track of drawing interactions; draw_last_feature refers to the most recent feature you drew (rectangle, polygon, point).
+
+study_area
+
+
+# STEP 6:
+# Define the per-image processing function (compute NDTI and masks)
+# Function to compute and mask NDTI (turbidity proxy)
+def compute_ndti(image):     # Declares a function named compute_ndti that takes an Earth Engine Image as input.
+     
+# 6.1 Cloud probability band (from linked cloud collection)
+    cloud_prob = image.select('probability')
+    low_cloud_mask = cloud_prob.lt(20)  # True where cloud probability < 20%
+
+    # Scale surface reflectance bands (Sentinel-2 SR scale factor = 1e-4)
+    sr = image.select('B.*').multiply(0.0001)
+
+    # NDWI: (Green - NIR) / (Green + NIR)
+    ndwi = sr.normalizedDifference(['B3', 'B8']).rename('ndwi')
+    water_mask = ndwi.gt(0.1)  # True where NDWI > 0.1 (likely water)
+
+    # NDTI: (Red - Green) / (Red + Green) — turbidity proxy
+    ndti = sr.normalizedDifference(['B4', 'B3']).rename('ndti')
+
+    # Apply cloud and water masks; keep original time property
+    ndti_masked = ndti.updateMask(low_cloud_mask).updateMask(water_mask).copyProperties(image, ['system:time_start'])
+    return ndti_masked
+
+# STEP 7:
+# Build Sentinel-2 collection, link cloud probability, filter by ROI and date, apply function
+s2_tc = (
+    ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+      .linkCollection(ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY"), 'probability')
+
+# Links the cloud probability collection to the SR collection. 
+# This attaches corresponding cloud probability images as auxiliary bands (under the name 'probability') 
+# for each SR image so that when you call .select('probability') inside compute_ndti, 
+# it finds the band. Linking is preferable to joining by ID in many cases.
+
+      .filterBounds(study_area)
+      .filterDate('2023', '2025')
+      .map(compute_ndti)
+)
+
+s2_tc
+
+# STEP 8:
+# Convert the Earth Engine ImageCollection to an xarray Dataset using xarray+ee engine
+xr_ds = xr.open_dataset(
+    s2_tc,
+    engine='ee',
+    crs='EPSG:4326',
+    scale=0.001,       # keep original scale value as in your script
+    geometry=study_area
+)
+# Uses xarray’s open_dataset with engine 'ee' (provided by xee) 
+# to convert the Earth Engine ImageCollection s2_tc into an xarray.Dataset. 
+# This pulls pixel values from the server into memory as labeled arrays 
+# with coordinates (time, lat, lon) or (time, y, x) depending on engine behavior.
+
+
+
+# Ensure time is sorted and force numeric type if needed
+xr_ds = xr_ds.sortby('time') * 1
+# xr_ds.sortby('time') sorts the dataset along the time coordinate so the time dimension is in chronological order.
+# Multiplying by 1 (* 1) forces a numeric/standard dtype conversion for certain xarray/engine outputs 
+# — a small trick to avoid lazy or problematic types when plotting/resampling.
+
+# Monthly resampling: take the maximum value in each month per pixel
+
+monthly_ds = xr_ds.resample(time='M').max('time') # .median() or .mean() for robust or typical conditions.
+
+# xr_ds.resample(time='M') — tell xarray to group the data into calendar months ('M').
+# .max('time') — for each group (month), take the pixel-wise maximum value across all images in that month. 
+# This produces one raster per month in which each pixel is the maximum NDTI observed 
+# in that month (useful to capture peak turbidity events).
+
+monthly_ds
+
+# STEP 9:
+# Plot monthly NDTI maps (small faceted panels)
+
+monthly_ds.ndti.plot(
+# monthly_ds.ndti — access the ndti DataArray from the monthly dataset.
+# .plot(x='lon', y='lat', col='time', ...) 
+# — instructs xarray’s plotting machinery (which uses Matplotlib) to generate a faceted set 
+# of maps: one panel per time value (month).
+
+    x='lon',
+    y='lat',
+    col='time',       # create separate columns/panels for each month/time step
+    robust=True,      # robust=True — use robust quantile-based colormap scaling to reduce the influence of outliers.
+    col_wrap=6,       # col_wrap=6 — wrap facets so there are at most 6 panels per row (useful for many months).
+    cmap='coolwarm',  # cmap='coolwarm' — color map choice (diverging centered around mid-values).
+    vmax=0.2          # vmax=0.2 — cap the upper color scale at 0.2 (units are NDTI). 
+                      # This fixes the color scaling for comparability.
+)
+
+# STEP 10:
+import matplotlib.pyplot as plt
+
+# Plot monthly NDTI maps (small faceted panels)
+plot_ndti = monthly_ds.ndti.plot(
+    x='lon',
+    y='lat',
+    col='time',
+    robust=True,
+    col_wrap=6,
+    cmap='coolwarm',
+    vmax=0.2
+)
+
+# Save the plot as a JPEG file
+plot_ndti.fig.savefig('ndti_maps.jpeg', dpi=300, bbox_inches='tight')
+print("NDTI maps saved as 'ndti_maps.jpeg'")
+
+# STEP 11:
+import matplotlib.pyplot as plt
+
+# Compute the spatial mean of NDTI for each month
+monthly_mean_ndti = monthly_ds.ndti.mean(dim=['lat', 'lon'])
+
+# Collapses spatial dimensions by computing the mean NDTI for each month across all pixels in the ROI. 
+# The result is a 1-D array indexed by time
+
+# Plot the time series of monthly mean NDTI
+plt.figure(figsize=(12, 6))        # Create a Matplotlib figure with a specified size in inches.
+monthly_mean_ndti.plot()           # Use xarray’s plotting (which wraps Matplotlib) to draw the 1-D time series.
+plt.title('Monthly Mean NDTI Time Series (January to December)')   # Add titles and axis labels for readability.
+plt.xlabel('Date')        # 
+plt.ylabel('Mean NDTI')
+plt.grid(True)            # Enable grid lines to make value reading easier.
+plt.show()                # Render the figure inline in the notebook.
+
+# STEP 12:
+# Compute spatial mean of monthly NDTI and save to CSV
+monthly_mean = monthly_ds.mean(dim=['lat', 'lon']).to_dataframe()
+
+# Converts the result into a pandas DataFrame where the index is the time coordinate 
+# and columns correspond to variables (e.g., ndti).
+
+monthly_mean.to_csv('turbidity_map.csv')
+# Writes the DataFrame to a CSV file named 'turbidity_map.csv' inside the Colab working directory.
+
+print("Saved turbidity_map.csv")
+
+# 
